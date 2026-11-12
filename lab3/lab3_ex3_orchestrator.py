@@ -4,8 +4,10 @@
     python lab3_ex3_orchestrator.py orchestrator  # orchestrator + structured worker call
     add --auto-approve to skip the HITL prompt when you only want to measure tokens
 """
+import json
 import random
 import sys
+import re
 from enum import Enum
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from agent_core import Decision, call_llm, run_agent
+from collections import Counter
 
 WORKDIR = Path("./lab3_data/ex3").resolve()
 LOG_NAME = "auth.log"
@@ -128,6 +131,79 @@ def delegate_log_triage(filename: str) -> str:
 # def grep_log(pattern, max_lines=20) / count_by_ip(pattern) / context_around(pattern, after=40)
 # def delegate_log_triage_agent(filename) -> runs run_agent() with those tools, returns JSON or ERROR
 
+SUBAGENT_SYSTEM = (
+    "You are a Tier-3 SOC investigator. You CANNOT read the whole log file. "
+    "Use your search tools (count_by_ip, grep_log, context_around) to find:\n"
+    "1. Brute-force sources vs background noise.\n"
+    "2. Whether any unauthorized login SUCCEEDED.\n"
+    "3. What happened immediately after a successful login (post-exploitation).\n"
+    "Never guess. Provide a factual summary with exact verbatim log lines as evidence."
+)
+
+def delegate_log_triage_agent(filename: str) -> str:
+    """Delegate log investigation to an autonomous ReAct sub-agent with search tools."""
+    try:
+        raw = safe_path(filename).read_text()
+    except (PermissionError, FileNotFoundError) as e:
+        return f"ERROR: {e}"
+
+    log_lines = raw.splitlines()
+
+    def grep_log(pattern: str, max_lines: int = 20) -> str:
+        """Search log lines matching a regex/substring pattern (capped at max_lines)."""
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"ERROR: Invalid regex '{pattern}': {e}"
+        matches = [line for line in log_lines if rx.search(line)]
+        if not matches:
+            return f"No matches for '{pattern}'."
+        shown = matches[:max_lines]
+        extra = f"\n... ({len(matches) - max_lines} more lines truncated)" if len(matches) > max_lines else ""
+        return "\n".join(shown) + extra
+
+    def count_by_ip(pattern: str) -> str:
+        """Count occurrences per IPv4 address for log lines matching pattern."""
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"ERROR: Invalid regex '{pattern}': {e}"
+        ip_rx = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        counts = Counter()
+        for line in log_lines:
+            if rx.search(line):
+                for ip in ip_rx.findall(line):
+                    counts[ip] += 1
+        if not counts:
+            return f"No IPs found in lines matching '{pattern}'."
+        return json.dumps(dict(counts.most_common(15)))
+
+    def context_around(pattern: str, after: int = 40) -> str:
+        """Find the first line matching pattern and return it along with the next `after` lines."""
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            return f"ERROR: Invalid regex '{pattern}': {e}"
+        for idx, line in enumerate(log_lines):
+            if rx.search(line):
+                snippet = log_lines[idx : idx + 1 + max(1, min(after, 100))]
+                return "\n".join(snippet)
+        return f"No match found for '{pattern}'."
+
+    sub_res = run_agent(
+        user_prompt=f"Investigate '{filename}' for signs of intrusion and post-exploitation.",
+        tools=[grep_log, count_by_ip, context_around],
+        system_instruction=SUBAGENT_SYSTEM,
+        max_steps=8,
+        verbose="--verbose" in sys.argv,
+    )
+    WORKER_TOKENS.extend(sub_res.prompt_tokens_per_step)
+
+    if sub_res.stop_reason != "done":
+        return f"ERROR: Sub-agent failed to complete investigation (stop_reason={sub_res.stop_reason})."
+
+    return _structured_worker(f"Convert these verified investigation findings into the TriageReport JSON:\n\n{sub_res.answer}")
+
 
 # --- HITL-protected report writer -----------------------------------------
 def write_incident_report(filename: str, markdown_report: str) -> str:
@@ -164,7 +240,12 @@ ORCH_SYSTEM = (
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "orchestrator"
     make_noisy_log()
-    first_tool = {"single": read_file, "orchestrator": delegate_log_triage}[mode]  # STRETCH: add "subagent"
+    # first_tool = {"single": read_file, "orchestrator": delegate_log_triage}[mode]  # STRETCH: add "subagent"
+    first_tool = {
+        "single": read_file,
+        "orchestrator": delegate_log_triage,
+        "subagent": delegate_log_triage_agent,
+    }[mode]
     how = "Read it yourself" if mode == "single" else "Use your specialist worker"
     result = run_agent(
         f"Triage '{LOG_NAME}'. {how}, then write the incident report to 'incident_report.md'.",
