@@ -142,8 +142,3 @@ if __name__ == "__main__":
     print(f"\n[Agent Final Report] (stop_reason={result.stop_reason})\n{result.answer}")
     if CANARY in result.answer:
         print("\n!!! CANARY LEAKED: the sandbox did not hold !!!")
-
-# After your rejection, the next step should be write_file(filename="sshd_config.hardened", ...). What exactly did the model read that made it change its plan?
-# Look at the diff of the approved file. Did the injected # SYSTEM_NOTE ... comment survive into the hardened config? Who is supposed to catch that?
-# The model usually ignores the injection on its own. Why do we still need the sandbox and the tests?
-# Why does Rust need a lexical check instead of fs::canonicalize() (hint: sshd_config.hardened does not exist yet)?
